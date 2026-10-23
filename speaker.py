@@ -27,6 +27,7 @@ SPK_MSG = {
     'zh': {
         'fallback': 'AI 网络语音中断，自动改用本地语音继续…',
         'net_fail': '网络语音失败（请检查网络），已停止',
+        'local_fail': '本地语音失败，已停止：%s',
         'paused': '已暂停（第 %d/%d 段）',
         'reading': '正在朗读第 %d/%d 段',
         'done': '朗读完成',
@@ -43,6 +44,7 @@ SPK_MSG = {
     'en': {
         'fallback': 'AI network voice lost, continuing with local voice...',
         'net_fail': 'Network voice failed (check internet), stopped',
+        'local_fail': 'Local voice failed, stopped: %s',
         'paused': 'Paused (segment %d/%d)',
         'reading': 'Reading segment %d/%d',
         'done': 'Finished reading',
@@ -492,6 +494,7 @@ class NeuralSpeaker:
         ready = queue.Queue(maxsize=4)
         stop = self._stop_evt
         handed_off = False
+        failed = False
 
         def _put(item):
             while not stop.is_set():
@@ -547,12 +550,13 @@ class NeuralSpeaker:
                     break
                 if kind == 'err':
                     fb = self._fallback
-                    if fb is not None and i > 1:
+                    if fb is not None:
                         handed_off = True
                         if on_state:
                             on_state(self._T('fallback'))
                         fb(chunks[i - 1:], on_progress, on_state)
                     else:
+                        failed = True
                         if on_state:
                             on_state(self._T('net_fail'))
                     break
@@ -566,12 +570,13 @@ class NeuralSpeaker:
                         path = self._synth_one(chunks[i - 1], i, tmp)
                     except Exception:
                         fb = self._fallback
-                        if fb is not None and i > 1:
+                        if fb is not None:
                             handed_off = True
                             if on_state:
                                 on_state(self._T('fallback'))
                             fb(chunks[i - 1:], on_progress, on_state)
                         else:
+                            failed = True
                             if on_state:
                                 on_state(self._T('net_fail'))
                         break
@@ -598,7 +603,8 @@ class NeuralSpeaker:
             with self._lock:
                 self._active_chunks = None
             shutil.rmtree(tmp, ignore_errors=True)
-            if on_state and not self._stop_evt.is_set() and not handed_off:
+            if (on_state and not self._stop_evt.is_set()
+                    and not handed_off and not failed):
                 on_state(self._T('done'))
             self._paused_evt.clear()
 
@@ -755,7 +761,7 @@ class SapiSpeaker:
             except Exception:
                 pass
             self._select_zh_voice()
-            return self._voice
+        return self._voice
 
     def _T(self, key, *args):
         msg = SPK_MSG.get(self._lang, SPK_MSG['zh']).get(key, key)
@@ -843,15 +849,24 @@ class SapiSpeaker:
                 self._thread.start()
 
     def _run(self):
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()   # 朗读线程自己的 COM 套间，否则复用界面线程建的对象会报 0x800401F0
+        except Exception:
+            pass
         while True:
             item = self._cmdq.get()
             if item is None:
                 break
             kind = item[0]
-            if kind == 'speak':
-                self._do_speak(*item[1:])
-            elif kind == 'stop':
-                self._hard_stop()
+            try:
+                if kind == 'speak':
+                    self._do_speak(*item[1:])
+                elif kind == 'stop':
+                    self._hard_stop()
+            except Exception as e:
+                if self._st is not None:
+                    self._st(self._T('local_fail', e))
 
     def _hard_stop(self):
         try:
